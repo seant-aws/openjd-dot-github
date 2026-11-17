@@ -32,11 +32,12 @@
 #        open_or_update_pr          open the PR from that bot branch into the default branch (or update the open
 #                                   one), add the train's labels, wait until GitHub reports the pushed head
 #        pr_status                  read a bot PR's state (merge detection)
+#        create_tag_and_prerelease  an annotated X.Y.Z tag on a commit reachable from the default branch, and a
+#                                   prerelease GitHub Release (rehearsal mode only, with the rehearsal title only; in
+#                                   live mode the repository's own release workflow tags and releases)
 #        comment                    a comment on a bot PR
-#        dispatch_workflow          the repository's own Release: Bump (release_bump.yml) on the default branch,
-#                                   with GITHUB_TOKEN (a workflow_dispatch in the job's own repository)
-#      The train never tags or releases: the repository's own Release: Publish does, after a person merges the
-#      release PR.
+#        dispatch_workflow          live mode only: the repository's own Release: Bump (release_bump.yml) on the
+#                                   default branch, with GITHUB_TOKEN (a workflow_dispatch in the job's own repository)
 #      Actions of one request run in order; after a failure the rest of that request is skipped.
 #   5. Report the results with {"phase": "report"}.
 #   6. Wait while the gateway says a train of this repository is busy (a step is running, or a gate this run just
@@ -79,14 +80,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-KINDS = frozenset({"push", "open_or_update_pr", "pr_status", "comment", "dispatch_workflow"})
+KINDS = frozenset({"push", "open_or_update_pr", "pr_status", "create_tag_and_prerelease", "comment",
+                   "dispatch_workflow"})
 # The modes a caller's RELEASE_TRAIN_MODE may name; any other value fails the run before anything is asked.
-MODES = frozenset({"live"})
+# Rehearsal exists only on this fork-testing branch, never upstream.
+MODES = frozenset({"live", "rehearsal"})
 # A bot branch: path components of safe characters, none starting with "." or ending in ".lock".
 BOT_BRANCH = re.compile(r"bot/(?!\.)[A-Za-z0-9._+-]+(?<!\.lock)(/(?!\.)[A-Za-z0-9._+-]+(?<!\.lock))*")
+RELEASE_TAG = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 SHA = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 ACTION_ID = re.compile(r"[A-Za-z0-9|_-]{1,200}")
+REHEARSAL_SUFFIX = "(release-train rehearsal, not an official release)"
 # The only labels the train asks for, with how they are created when missing.
 LABELS = {"agent-modified": ("d93f0b", "Contains commits written by the release train's fix agent; needs human review"),
           "needs-human": ("b60205", "The release train's fix agent could not finish; a person must complete this PR")}
@@ -235,6 +240,18 @@ def validate(action: Any, ctx: Context) -> dict[str, Any]:
         _number(action)
         _bot(action)
         _sha(action, "tip")
+    elif kind == "create_tag_and_prerelease":
+        if ctx.mode != "rehearsal":
+            raise Refused("create_tag_and_prerelease: only in rehearsal mode (in live mode the repository's own "
+                          "release workflow tags and releases)")
+        tag: str = _str(action, "tag", 40)
+        if not RELEASE_TAG.fullmatch(tag):
+            raise Refused(f"create_tag_and_prerelease: refusing tag {tag!r}: only X.Y.Z")
+        _sha(action, "sha")
+        title = _str(action, "title", MAX_TITLE)
+        if ctx.mode == "rehearsal" and not title.endswith(REHEARSAL_SUFFIX):
+            raise Refused(f"create_tag_and_prerelease: a rehearsal release must be titled '... {REHEARSAL_SUFFIX}'")
+        _str(action, "notes", 125000)
     elif kind == "comment":
         _number(action)
         _str(action, "body", MAX_BODY)
@@ -242,7 +259,7 @@ def validate(action: Any, ctx: Context) -> dict[str, Any]:
         if _str(action, "workflow", 200) not in DISPATCHABLE:
             raise Refused(f"dispatch_workflow: only {sorted(DISPATCHABLE)} may be dispatched")
         if ctx.mode != "live":
-            raise Refused("dispatch_workflow: only in live mode")
+            raise Refused("dispatch_workflow: only in live mode (a rehearsal releases through the train's own PR)")
         if _str(action, "ref", 200) != ctx.default_branch:
             raise Refused(f"dispatch_workflow: only on the default branch {ctx.default_branch}, not {action['ref']!r}")
         inputs: Any = action.get("inputs", {})
@@ -422,6 +439,41 @@ def do_pr_status(action: dict[str, Any], ctx: Context) -> dict[str, Any]:
     return _pr_out(pr)
 
 
+def do_create_tag_and_prerelease(action: dict[str, Any], ctx: Context) -> dict[str, Any]:
+    tag: str = action["tag"]
+    sha: str = action["sha"]
+    default_tip: str = ensure_clone(ctx)
+    if not _ancestor(ctx, sha, default_tip):
+        raise Refused(f"create_tag_and_prerelease: {sha[:12]} is not reachable from {ctx.default_branch}")
+    try:
+        ref: dict[str, Any] | None = ctx.api("GET", f"/repos/{ctx.repo}/git/ref/tags/{tag}")
+    except ApiError as e:
+        if e.status != 404:
+            raise
+        ref = None
+    if ref is not None:
+        target: dict[str, Any] = ref["object"]
+        named: str = str(target["sha"])
+        if target.get("type") == "tag":
+            named = str(ctx.api("GET", f"/repos/{ctx.repo}/git/tags/{named}")["object"]["sha"])
+        if named != sha:
+            raise Refused(f"create_tag_and_prerelease: tag {tag} already names {named[:12]}, not {sha[:12]}")
+    else:
+        obj: dict[str, Any] = ctx.api("POST", f"/repos/{ctx.repo}/git/tags", {
+            "tag": tag, "message": action["title"], "object": sha, "type": "commit"})
+        ctx.api("POST", f"/repos/{ctx.repo}/git/refs", {"ref": f"refs/tags/{tag}", "sha": obj["sha"]})
+    try:
+        release: dict[str, Any] = ctx.api("GET", f"/repos/{ctx.repo}/releases/tags/{tag}")
+        if not release.get("prerelease") or release.get("name") != action["title"]:
+            raise Refused(f"create_tag_and_prerelease: release {tag} exists but is not this prerelease")
+    except ApiError as e:
+        if e.status != 404:
+            raise
+        release = ctx.api("POST", f"/repos/{ctx.repo}/releases", {
+            "tag_name": tag, "name": action["title"], "body": action["notes"], "prerelease": True, "draft": False})
+    return {"tag": tag, "sha": sha, "release_url": str(release["html_url"])}
+
+
 def do_comment(action: dict[str, Any], ctx: Context) -> dict[str, Any]:
     _own_bot_pr(ctx.api("GET", f"/repos/{ctx.repo}/pulls/{action['number']}"), ctx)
     made: dict[str, Any] = ctx.api("POST", f"/repos/{ctx.repo}/issues/{action['number']}/comments",
@@ -438,7 +490,8 @@ def do_dispatch_workflow(action: dict[str, Any], ctx: Context) -> dict[str, Any]
 
 
 HANDLERS: dict[str, Callable[[dict[str, Any], Context], dict[str, Any]]] = {
-    "push": do_push, "open_or_update_pr": do_open_or_update_pr, "pr_status": do_pr_status, "comment": do_comment,
+    "push": do_push, "open_or_update_pr": do_open_or_update_pr, "pr_status": do_pr_status,
+    "create_tag_and_prerelease": do_create_tag_and_prerelease, "comment": do_comment,
     "dispatch_workflow": do_dispatch_workflow}
 
 
