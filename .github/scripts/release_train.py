@@ -105,6 +105,12 @@ FANOUT_WORKFLOW = "release_train.yml"
 DISPATCH_TOKEN_ENV: dict[str, str] = {"openjobdescription": "RT_DISPATCH_TOKEN_OPENJOBDESCRIPTION",
                                       "aws-deadline": "RT_DISPATCH_TOKEN_AWS_DEADLINE"}
 DISPATCH_ORG_NAMES: dict[str, str] = {"openjobdescription": "OpenJobDescription", "aws-deadline": "aws-deadline"}
+# Fork testing only (this rehearsal branch, never upstream): the seant-aws forks, each mapped to the organization
+# whose token dispatches it, the same token its upstream repository gets. No other seant-aws repository is allowed.
+FORK_DISPATCH_ORGS: dict[str, str] = {"seant-aws/openjd-model-for-python": "openjobdescription",
+                                      "seant-aws/openjd-sessions-for-python": "openjobdescription",
+                                      "seant-aws/openjd-cli": "openjobdescription",
+                                      "seant-aws/deadline-cloud-worker-agent": "aws-deadline"}
 REPO_NAME = re.compile(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}")
 BRANCH_NAME = re.compile(r"(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,100}(?<![./])")
 CLAIM_KEY = re.compile(r"DISPATCH#release#[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}#[A-Za-z0-9._:-]{1,100}#"
@@ -805,6 +811,12 @@ def run() -> int:
 # -- the dispatch step ------------------------------------------------------------
 
 
+def dispatch_org(repo: str) -> str:
+    """The organization (lower case) whose token dispatches `repo`: its owner, or for a seant-aws fork its
+    upstream's organization (FORK_DISPATCH_ORGS). Not a key of DISPATCH_TOKEN_ENV when the repo is refused."""
+    return FORK_DISPATCH_ORGS.get(repo.lower(), repo.split("/", 1)[0].lower())
+
+
 def parse_repos(text: str) -> frozenset[str]:
     """The caller's hard-coded dispatch_repos: owner/repo names separated by commas, spaces or lines."""
     return frozenset(r for r in re.split(r"[\s,]+", text or "") if r)
@@ -820,7 +832,7 @@ def _dispatch_one(target: dict[str, Any], tokens: dict[str, str], allowed: set[s
             or target.get("workflow") != FANOUT_WORKFLOW or not BRANCH_NAME.fullmatch(ref):
         out["error"] = f"a dispatch may start only {FANOUT_WORKFLOW} of an owner/repo on a branch"
         return out
-    org: str = repo.split("/", 1)[0].lower()
+    org: str = dispatch_org(repo)
     if org not in DISPATCH_TOKEN_ENV:
         out["error"] = f"{repo} is owned by neither OpenJobDescription nor aws-deadline"
         return out
@@ -886,7 +898,7 @@ def run_dispatch() -> int:
     base: str = os.environ.get("GITHUB_API_URL", "https://api.github.com")
     results: list[dict[str, Any]] = dispatch(doc, tokens, parse_repos(os.environ.get("RT_DISPATCH_REPOS", "")),
                                              lambda t: github_api(t, base))
-    for org in sorted({r["repo"].split("/", 1)[0].lower() for r in results if r["outcome"] == "no-token"}):
+    for org in sorted({dispatch_org(r["repo"]) for r in results if r["outcome"] == "no-token"}):
         print(f"::notice::No dispatch token is configured for {DISPATCH_ORG_NAMES[org]}: its downstream "
               "repositories are not dispatched; their daily release-train run picks the release up.")
     lines: list[str] = ["## Downstream dispatches", "", "| repository | result |", "| --- | --- |"]

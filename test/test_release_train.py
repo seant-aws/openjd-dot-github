@@ -838,7 +838,7 @@ class TestDispatchStep(TestCase):
                                  [f"/repos/{dispatched}/actions/workflows/release_train.yml/dispatches"])
 
     def test_an_unknown_owner_is_refused_without_calling_github(self) -> None:
-        for repo in ("example-owner/cli", "seant-aws/openjd-cli", "OpenJobDescription-x/openjd-cli"):
+        for repo in ("example-owner/cli", "seant-aws/openjd-rs", "OpenJobDescription-x/openjd-cli"):
             with self.subTest(repo=repo):
                 target = {**TARGET, "repo": repo, "key": f"DISPATCH#release#{repo}#openjd-sessions#0.15.2"}
                 (result,) = self.dispatch(targets=[target], repos=repo, allowed=[repo])
@@ -846,6 +846,28 @@ class TestDispatchStep(TestCase):
                 self.assertIn("neither OpenJobDescription nor aws-deadline", result["error"])
                 self.assertEqual(self.api.calls, [])
                 self.assertEqual(self.tokens_used, [])
+
+    def test_each_seant_aws_fork_gets_its_upstream_orgs_token(self) -> None:
+        for repo, token in (("seant-aws/openjd-model-for-python", OPENJD_TOKEN),
+                            ("seant-aws/openjd-sessions-for-python", OPENJD_TOKEN),
+                            ("seant-aws/openjd-cli", OPENJD_TOKEN),
+                            ("Seant-AWS/deadline-cloud-worker-agent", AWS_DEADLINE_TOKEN)):
+            with self.subTest(repo=repo):
+                target = {**TARGET, "repo": repo, "key": f"DISPATCH#release#{repo}#openjd-sessions#0.15.2"}
+                (result,) = self.dispatch(targets=[target], repos=repo, allowed=[repo])
+                self.assertEqual((result["ok"], result["outcome"]), (True, "dispatched"))
+                self.assertEqual(self.tokens_used, [token])
+                self.assertEqual([c[1] for c in self.api.calls if c[0] == "POST"],
+                                 [f"/repos/{repo}/actions/workflows/release_train.yml/dispatches"])
+
+    def test_a_fork_without_its_orgs_token_skips_without_the_other_token(self) -> None:
+        repo = "seant-aws/deadline-cloud-worker-agent"
+        target = {**TARGET, "repo": repo, "key": f"DISPATCH#release#{repo}#openjd-sessions#0.15.2"}
+        (result,) = self.dispatch(tokens={"openjobdescription": OPENJD_TOKEN}, targets=[target], repos=repo,
+                                  allowed=[repo])
+        self.assertEqual((result["ok"], result["outcome"]), (False, "no-token"))
+        self.assertIn("aws-deadline", result["error"])
+        self.assertEqual(self.tokens_used, [])
 
     def test_a_repo_missing_from_either_list_is_refused_without_calling_github(self) -> None:
         for repos, allowed in (("OpenJobDescription/other", [CLI]), (CLI, []), ("", [CLI])):
@@ -931,6 +953,26 @@ class TestRunDispatch(TestCase):
         self.assertEqual(len(notices), 1)
         self.assertIn("OpenJobDescription", notices[0])
         self.assertIn(f"| {CLI} | no-token", summary)
+
+    def test_a_forks_missing_token_is_a_notice_naming_its_upstream_org(self) -> None:
+        fork = "seant-aws/openjd-cli"
+        target = {**TARGET, "repo": fork, "key": f"DISPATCH#release#{fork}#openjd-sessions#0.15.2"}
+        with tempfile.TemporaryDirectory() as tmp:
+            dispatch_file = Path(tmp) / "dispatch.json"
+            dispatch_file.write_text(json.dumps({"allowed": [fork], "targets": [target]}))
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, {"RT_DISPATCH_FILE": str(dispatch_file), "RT_DISPATCH_REPOS": fork,
+                                              "RT_GATEWAY_FUNCTION": "fn", "RT_GATEWAY_AUDIENCE": "aud",
+                                              "GITHUB_STEP_SUMMARY": "", "RUNNER_TEMP": tmp,
+                                              "RT_DISPATCH_TOKEN_OPENJOBDESCRIPTION": "",
+                                              "RT_DISPATCH_TOKEN_AWS_DEADLINE": AWS_DEADLINE_TOKEN}), \
+                    mock.patch.object(rt, "id_token", lambda audience: "id-t0ken"), \
+                    mock.patch.object(rt, "invoke", lambda fn, payload, workdir: {}), \
+                    contextlib.redirect_stdout(out):
+                self.assertEqual(rt.run_dispatch(), 0)
+        notices = [line for line in out.getvalue().splitlines() if line.startswith("::notice::")]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("OpenJobDescription", notices[0])
 
     def test_tokens_never_appear_in_the_log_summary_or_report(self) -> None:
         for status in (204, 401, 403, 500):
